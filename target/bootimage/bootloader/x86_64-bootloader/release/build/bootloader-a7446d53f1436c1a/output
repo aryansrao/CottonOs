@@ -1,0 +1,7 @@
+cargo:rerun-if-changed=/Users/aryans.rao/Library/Mobile Documents/com~apple~CloudDocs/CottonOs/Cargo.toml
+cargo:rustc-link-search=native=/Users/aryans.rao/Library/Mobile Documents/com~apple~CloudDocs/CottonOs/target/bootimage/bootloader/x86_64-bootloader/release/build/bootloader-a7446d53f1436c1a/out
+cargo:rustc-link-lib=static=kernel_bin-cotton_os
+cargo:rerun-if-env-changed=KERNEL
+cargo:rerun-if-env-changed=KERNEL_MANIFEST
+cargo:rerun-if-changed=/Users/aryans.rao/Library/Mobile Documents/com~apple~CloudDocs/CottonOs/target/x86_64-cotton_os/debug/cotton_os
+cargo:rerun-if-changed=build.rs
