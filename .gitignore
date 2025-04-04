@@ -1,0 +1,45 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.o
+*.bin
+*.elf
+*.img
+*.iso
+Cargo.lock
+
+# QEMU files
+*.qcow2
+*.vmdk
+
+# Bootloader artifacts
+bootimage-*.bin
+
+# macOS specific files
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# Editor/IDE specific files
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*~
+
+# Specific directories that might contain large or unnecessary files
+/tmp/
+/temp/
+/local/
+/tmp_cotton_os_build/
+/bootimage/
