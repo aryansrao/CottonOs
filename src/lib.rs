@@ -9,6 +9,7 @@ use core::panic::PanicInfo;
 pub mod vga_buffer;
 pub mod serial;
 pub mod animation;
+pub mod keyboard;
 
 pub trait Testable {
     fn run(&self) -> ();
@@ -38,6 +39,11 @@ pub fn test_panic_handler(info: &PanicInfo) -> ! {
     serial_println!("Error: {}\n", info);
     exit_qemu(QemuExitCode::Failed);
     loop {}
+}
+
+// Debug helper function to help check system status
+pub fn debug_status() -> bool {
+    animation::debug_welcome_flag()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

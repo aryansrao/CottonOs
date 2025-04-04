@@ -1,7 +1,10 @@
 use crate::vga_buffer::{self, Color};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 
 static TIMER_COUNT: AtomicU64 = AtomicU64::new(0);
+static WELCOME_SHOWN: AtomicBool = AtomicBool::new(false);
+// A global flag to directly control welcome screen display
+static mut BYPASS_WELCOME: bool = false;
 
 pub fn increment_timer() {
     TIMER_COUNT.fetch_add(1, Ordering::SeqCst);
@@ -14,70 +17,6 @@ pub fn get_timer() -> u64 {
 pub fn sleep(ms: u64) {
     let start = get_timer();
     while get_timer() - start < ms {}
-}
-
-pub fn rainbow_text(row: usize, col: usize, text: &str, frame: u64) {
-    let colors = [
-        Color::Red,
-        Color::LightRed,
-        Color::Yellow,
-        Color::Green,
-        Color::LightGreen,
-        Color::Cyan,
-        Color::LightBlue,
-        Color::Blue,
-        Color::Magenta,
-        Color::Pink,
-    ];
-    
-    for (i, byte) in text.bytes().enumerate() {
-        if byte == b' ' {
-            continue;
-        }
-        
-        let color_index = ((i as u64 + frame) % colors.len() as u64) as usize;
-        vga_buffer::write_at(row, col + i, byte, colors[color_index], Color::Black);
-    }
-}
-
-pub fn draw_box(start_row: usize, start_col: usize, width: usize, height: usize, color: Color) {
-    // Draw top and bottom borders
-    for col in start_col..start_col + width {
-        vga_buffer::write_at(start_row, col, b'-', color, Color::Black);
-        vga_buffer::write_at(start_row + height - 1, col, b'-', color, Color::Black);
-    }
-    
-    // Draw left and right borders
-    for row in start_row..start_row + height {
-        vga_buffer::write_at(row, start_col, b'|', color, Color::Black);
-        vga_buffer::write_at(row, start_col + width - 1, b'|', color, Color::Black);
-    }
-    
-    // Draw corners
-    vga_buffer::write_at(start_row, start_col, b'+', color, Color::Black);
-    vga_buffer::write_at(start_row, start_col + width - 1, b'+', color, Color::Black);
-    vga_buffer::write_at(start_row + height - 1, start_col, b'+', color, Color::Black);
-    vga_buffer::write_at(start_row + height - 1, start_col + width - 1, b'+', color, Color::Black);
-}
-
-pub fn display_fancy_welcome() {
-    vga_buffer::clear_screen();
-
-    // Draw the CottonOS logo
-    draw_cotton_logo(2, 10);
-    
-    // Let's make sure text is visible by using known good positions and simplified code
-    // Basic welcome message
-    vga_buffer::write_str_at(12, 20, "Welcome to CottonOS!", Color::White, Color::Black);
-    vga_buffer::write_str_at(13, 20, "A Rust-based Operating System", Color::Yellow, Color::Black);
-    
-    // Explicitly add the GitHub URL - keeping it simple
-    vga_buffer::write_str_at(15, 10, "IMPORTANT: This OS is under active development!", Color::LightRed, Color::Black);
-    vga_buffer::write_str_at(16, 10, "Contribute at: github.com/aryansrao/CottonOs", Color::LightGreen, Color::Black);
-    
-
-    // Add some delay to ensure visibility
-    sleep(1000);
 }
 
 // Add a function to draw a cotton logo
@@ -112,4 +51,101 @@ pub fn draw_cotton_logo(start_row: usize, start_col: usize) {
             }
         }
     }
+}
+
+// Add a debug function to print the current state of the welcome flag
+pub fn debug_welcome_flag() -> bool {
+    WELCOME_SHOWN.load(Ordering::SeqCst)
+}
+
+// Make sure disable_welcome_screen is extra forceful
+pub fn disable_welcome_screen() {
+    // Use a loop to ensure the value is properly set
+    WELCOME_SHOWN.store(true, Ordering::SeqCst);
+    
+    // Double-check that it actually got set
+    if !WELCOME_SHOWN.load(Ordering::SeqCst) {
+        // Try again with a different ordering
+        WELCOME_SHOWN.store(true, Ordering::Release);
+        WELCOME_SHOWN.store(true, Ordering::Relaxed);
+    }
+
+    // Also set our bypass flag
+    unsafe {
+        BYPASS_WELCOME = true;
+    }
+}
+
+// Add a function to reset the welcome screen flag
+pub fn reset_welcome_screen() {
+    WELCOME_SHOWN.store(false, Ordering::SeqCst);
+    // Reset our bypass flag as well
+    unsafe {
+        BYPASS_WELCOME = false;
+    }
+}
+
+// Simple welcome screen with ASCII art
+pub fn display_welcome_screen() {
+    // Most direct check first - bypass everything if set
+    unsafe {
+        if BYPASS_WELCOME {
+            return;
+        }
+    }
+
+    // Check if we already showed the welcome screen this boot
+    if WELCOME_SHOWN.load(Ordering::SeqCst) {
+        // Skip showing welcome screen to avoid disrupting command flow
+        return;
+    }
+    
+    // Make sure we don't get stuck in a loop
+    static mut WELCOME_ATTEMPT_COUNT: u8 = 0;
+    
+    unsafe {
+        WELCOME_ATTEMPT_COUNT += 1;
+        if WELCOME_ATTEMPT_COUNT > 1 {
+            // If we've already tried to show the welcome screen more than once
+            // since boot, force the flag to true and return
+            WELCOME_SHOWN.store(true, Ordering::SeqCst);
+            return;
+        }
+    }
+    
+    vga_buffer::clear_screen();
+
+    // Draw the CottonOS logo
+    draw_cotton_logo(5, 10);
+    
+    // Display a simple welcome message
+    vga_buffer::write_str_at(12, 20, "Welcome to CottonOS!", Color::White, Color::Black);
+    vga_buffer::write_str_at(13, 20, "A Rust-based Operating System", Color::Yellow, Color::Black);
+    
+    // GitHub URL
+    vga_buffer::write_str_at(16, 10, "Contribute at: github.com/aryansrao/CottonOs", Color::LightGreen, Color::Black);
+    
+    // Shell instruction
+    vga_buffer::write_str_at(19, 20, "Press SPACE to start the shell...", Color::White, Color::Black);
+    
+    // Wait for spacebar specifically
+    loop {
+        let key = crate::keyboard::wait_for_keypress();
+        if key == crate::keyboard::SCAN_SPACE {
+            break;
+        }
+    }
+    
+    // Make sure this flag is set
+    WELCOME_SHOWN.store(true, Ordering::SeqCst);
+}
+
+// Simple shell prompt
+pub fn display_shell_prompt(line: usize) {
+    vga_buffer::write_str_at(line, 0, "cottonos> ", Color::Green, Color::Black);
+}
+
+// Function to wait for user input
+pub fn wait_for_keypress() -> u8 {
+    crate::keyboard::wait_for_keypress()
 }

@@ -7,3 +7,7 @@ build-std-features = ["compiler-builtins-mem"]
 
 [target.'cfg(target_os = "none")']
 runner = "bootimage runner"
+
+# Needed for Apple Silicon Macs
+[env]
+CC_x86_64_unknown_none = "x86_64-unknown-linux-gnu-gcc"
