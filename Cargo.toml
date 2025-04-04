@@ -1,0 +1,27 @@
+[package]
+name = "cotton_os"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name"]
+
+[dependencies]
+bootloader = "0.9.23"
+spin = "0.9.8"
+x86_64 = "0.14.10"
+uart_16550 = "0.2.18"
+pic8259 = "0.10.4"
+pc-keyboard = "0.7.0"
+
+[package.metadata.bootimage]
+test-args = [
+    "-device", "virtio-gpu-pci",
+    "-display", "sdl",
+    "-serial", "stdio",
+    "-device", "virtio-mouse-pci",
+]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
