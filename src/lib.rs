@@ -8,6 +8,7 @@ use core::panic::PanicInfo;
 
 pub mod vga_buffer;
 pub mod serial;
+pub mod animation;
 
 pub trait Testable {
     fn run(&self) -> ();

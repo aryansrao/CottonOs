@@ -141,3 +141,46 @@ pub fn _print(args: fmt::Arguments) {
     use core::fmt::Write;
     WRITER.lock().write_fmt(args).unwrap();
 }
+
+pub fn clear_screen() {
+    use core::fmt::Write;
+    for _ in 0..BUFFER_HEIGHT {
+        WRITER.lock().write_str("\n").unwrap();
+    }
+    WRITER.lock().column_position = 0;
+}
+
+pub fn write_at(row: usize, col: usize, byte: u8, fg: Color, bg: Color) {
+    if row >= BUFFER_HEIGHT || col >= BUFFER_WIDTH {
+        return;
+    }
+    
+    let mut writer = WRITER.lock();
+    let color_code = ColorCode::new(fg, bg);
+    
+    writer.buffer.chars[row][col].write(ScreenChar {
+        ascii_character: byte,
+        color_code,
+    });
+}
+
+pub fn write_str_at(row: usize, col: usize, s: &str, fg: Color, bg: Color) {
+    let mut current_col = col;
+    for byte in s.bytes() {
+        if current_col >= BUFFER_WIDTH {
+            break;
+        }
+
+        if byte == b'\n' {
+            break;
+        }
+
+        if (0x20..=0x7e).contains(&byte) {
+            write_at(row, current_col, byte, fg, bg);
+            current_col += 1;
+        } else {
+            write_at(row, current_col, 0xfe, fg, bg);
+            current_col += 1;
+        }
+    }
+}
