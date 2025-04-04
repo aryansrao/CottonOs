@@ -103,16 +103,16 @@ fn process_command(cmd: &[u8]) {
         write_str_at(get_current_line() + 3, 0, "GitHub: github.com/aryansrao/CottonOs", Color::LightGreen, Color::Black);
     }
     else if starts_with(cmd, b"exit") {
-        // Only "exit" command should return to welcome screen
+        // Use the force_welcome_screen function instead
+        animation::force_welcome_screen();
+        
+        // Clear the screen after welcome screen
         clear_screen();
-        animation::reset_welcome_screen(); // Reset the flag to show welcome screen again
-        animation::display_welcome_screen(); // Show welcome screen
-        clear_screen(); // Clear after welcome screen
+        
+        // Return to shell
+        return;
     }
     else if starts_with(cmd, b"sysinfo") {
-        // Rather than using a complex approach that might cause issues,
-        // let's use a much simpler implementation for sysinfo
-
         // First ensure welcome screen won't show
         animation::disable_welcome_screen();
 

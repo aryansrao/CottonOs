@@ -5,6 +5,8 @@ static TIMER_COUNT: AtomicU64 = AtomicU64::new(0);
 static WELCOME_SHOWN: AtomicBool = AtomicBool::new(false);
 // A global flag to directly control welcome screen display
 static mut BYPASS_WELCOME: bool = false;
+// Counter for welcome screen attempts
+static mut WELCOME_ATTEMPT_COUNT: u8 = 0;
 
 pub fn increment_timer() {
     TIMER_COUNT.fetch_add(1, Ordering::SeqCst);
@@ -101,8 +103,6 @@ pub fn display_welcome_screen() {
     }
     
     // Make sure we don't get stuck in a loop
-    static mut WELCOME_ATTEMPT_COUNT: u8 = 0;
-    
     unsafe {
         WELCOME_ATTEMPT_COUNT += 1;
         if WELCOME_ATTEMPT_COUNT > 1 {
@@ -137,6 +137,41 @@ pub fn display_welcome_screen() {
     }
     
     // Make sure this flag is set
+    WELCOME_SHOWN.store(true, Ordering::SeqCst);
+}
+
+// Force-display welcome screen regardless of flags
+pub fn force_welcome_screen() {
+    // Reset flags first
+    WELCOME_SHOWN.store(false, Ordering::SeqCst);
+    
+    // Reset bypass flag 
+    unsafe {
+        BYPASS_WELCOME = false;
+        // Reset the attempt counter
+        WELCOME_ATTEMPT_COUNT = 0;
+    }
+    
+    // Clear screen
+    vga_buffer::clear_screen();
+
+    // Draw the CottonOS logo and rest of welcome screen
+    draw_cotton_logo(5, 10);
+    
+    vga_buffer::write_str_at(12, 20, "Welcome to CottonOS!", Color::White, Color::Black);
+    vga_buffer::write_str_at(13, 20, "A Rust-based Operating System", Color::Yellow, Color::Black);
+    vga_buffer::write_str_at(16, 10, "Contribute at: github.com/aryansrao/CottonOs", Color::LightGreen, Color::Black);
+    vga_buffer::write_str_at(19, 20, "Press SPACE to start the shell...", Color::White, Color::Black);
+    
+    // Wait for spacebar
+    loop {
+        let key = crate::keyboard::wait_for_keypress();
+        if key == crate::keyboard::SCAN_SPACE {
+            break;
+        }
+    }
+    
+    // Set the flag to true after showing
     WELCOME_SHOWN.store(true, Ordering::SeqCst);
 }
 
