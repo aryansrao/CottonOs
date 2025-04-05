@@ -60,21 +60,28 @@ pub fn debug_welcome_flag() -> bool {
     WELCOME_SHOWN.load(Ordering::SeqCst)
 }
 
-// Make sure disable_welcome_screen is extra forceful
+// Make the disable_welcome_screen function even more forceful
 pub fn disable_welcome_screen() {
-    // Use a loop to ensure the value is properly set
+    // First set the atomic flag with sequential consistency
     WELCOME_SHOWN.store(true, Ordering::SeqCst);
     
-    // Double-check that it actually got set
+    // Double-check that it got set, if not try other orderings
     if !WELCOME_SHOWN.load(Ordering::SeqCst) {
-        // Try again with a different ordering
+        // Try again with different memory orderings
         WELCOME_SHOWN.store(true, Ordering::Release);
         WELCOME_SHOWN.store(true, Ordering::Relaxed);
     }
-
-    // Also set our bypass flag
+    
+    // Also explicitly set our bypass flag
     unsafe {
         BYPASS_WELCOME = true;
+        // Reset welcome attempt count for good measure
+        WELCOME_ATTEMPT_COUNT = 0;
+    }
+    
+    // Add a small delay to ensure the change propagates
+    for _ in 0..1000 {
+        core::hint::spin_loop();
     }
 }
 
@@ -89,9 +96,10 @@ pub fn reset_welcome_screen() {
 
 // Simple welcome screen with ASCII art
 pub fn display_welcome_screen() {
-    // Most direct check first - bypass everything if set
+    // Extra initial bypass check
     unsafe {
         if BYPASS_WELCOME {
+            // If bypass is set, always skip welcome
             return;
         }
     }
