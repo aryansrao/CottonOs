@@ -6,7 +6,13 @@ use embedded_io::ErrorType;
 use embedded_io::{Read, Write};
 use embedded_tls::blocking::{Aes128GcmSha256, TlsConfig, TlsConnection, TlsContext, UnsecureProvider};
 use rand_core::{CryptoRng, Error as RandError, RngCore};
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+
+/// Global deadline (in scheduler ticks) for the current TLS operation.
+/// Set before starting any TLS call, checked in KernelTcpStream::read().
+/// Eliminates the per-read timeout that was firing too early on multi-read
+/// TLS 1.3 handshakes (e.g. Google's certificate chain requires many reads).
+static TLS_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
 
 #[derive(Debug, Clone, Copy)]
 enum NetIoError {
@@ -71,8 +77,6 @@ impl Read for KernelTcpStream {
         if buf.is_empty() {
             return Ok(0);
         }
-
-        let start = crate::proc::scheduler::ticks();
         loop {
             crate::drivers::network::poll();
 
@@ -82,10 +86,13 @@ impl Read for KernelTcpStream {
             }
 
             if !crate::drivers::network::tcp_is_connected() {
-                return Ok(0);
+                return Ok(0); // EOF — server closed connection
             }
 
-            if (crate::proc::scheduler::ticks() - start) > 4000 {
+            // Single global deadline covers the whole TLS operation (handshake + body).
+            // This avoids per-read timeouts that fire too early when the TLS handshake
+            // needs many small reads (e.g. large certificate chains from Google).
+            if crate::proc::scheduler::ticks() >= TLS_DEADLINE.load(Ordering::Relaxed) {
                 return Err(NetIoError::Timeout);
             }
 
@@ -226,10 +233,21 @@ impl RngCore for KernelRng {
 impl CryptoRng for KernelRng {}
 
 pub fn https_get(host: &str, ip: [u8; 4], path: &str) -> Result<String, String> {
-    let stream = KernelTcpStream::connect(ip, 443).map_err(|_| String::from("httpsget: tcp connect failed"))?;
+    // 20-second global deadline for the TLS handshake.
+    // After the handshake we reset to 15 seconds for body reading.
+    TLS_DEADLINE.store(
+        crate::proc::scheduler::ticks() + 20000,
+        Ordering::Relaxed,
+    );
 
-    let mut read_record_buffer = vec![0u8; 16384];
-    let mut write_record_buffer = vec![0u8; 4096];
+    let stream = KernelTcpStream::connect(ip, 443).map_err(|_| {
+        TLS_DEADLINE.store(u64::MAX, Ordering::Relaxed);
+        String::from("httpsget: tcp connect failed")
+    })?;
+
+    // 18 KB read buffer handles large TLS 1.3 records (max 16384 + overhead)
+    let mut read_record_buffer = vec![0u8; 18432];
+    let mut write_record_buffer = vec![0u8; 8192];
 
     let config = TlsConfig::new()
         .with_server_name(host)
@@ -241,14 +259,26 @@ pub fn https_get(host: &str, ip: [u8; 4], path: &str) -> Result<String, String> 
         write_record_buffer.as_mut_slice(),
     );
 
-    tls.open(TlsContext::new(
+    // Handshake: always clean up TCP on failure so next connect doesn't fail
+    // with "tcp already active". The 20-second deadline (set above) covers this.
+    if let Err(e) = tls.open(TlsContext::new(
         &config,
         UnsecureProvider::new::<Aes128GcmSha256>(KernelRng::new()),
-    ))
-    .map_err(|e| format!("httpsget: tls handshake failed: {:?}", e))?;
+    )) {
+        TLS_DEADLINE.store(u64::MAX, Ordering::Relaxed);
+        let _ = crate::drivers::network::tcp_close();
+        return Err(format!("httpsget: tls handshake failed: {:?}", e));
+    }
 
+    // Switch to a 15-second deadline for reading the HTTP response body
+    TLS_DEADLINE.store(
+        crate::proc::scheduler::ticks() + 15000,
+        Ordering::Relaxed,
+    );
+
+    // HTTP/1.0 avoids chunked transfer-encoding
     let req = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: CottonOS\r\nConnection: close\r\nAccept: */*\r\n\r\n",
+        "GET {} HTTP/1.0\r\nHost: {}\r\nUser-Agent: CottonBrowser/0.1\r\nAccept: text/html,*/*\r\nConnection: close\r\n\r\n",
         path,
         host
     );
@@ -268,19 +298,27 @@ pub fn https_get(host: &str, ip: [u8; 4], path: &str) -> Result<String, String> 
         .map_err(|e| format!("httpsget: tls flush failed: {:?}", e))?;
 
     let mut out = String::new();
+    const MAX_RESP: usize = 65536;
     let mut buf = [0u8; 2048];
     loop {
         match tls.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => out.push_str(&String::from_utf8_lossy(&buf[..n])),
+            Ok(n) => {
+                out.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if out.len() >= MAX_RESP {
+                    break;
+                }
+            }
             Err(e) => {
                 if out.is_empty() {
+                    TLS_DEADLINE.store(u64::MAX, Ordering::Relaxed);
                     return Err(format!("httpsget: tls read failed: {:?}", e));
                 }
                 break;
             }
         }
     }
+    TLS_DEADLINE.store(u64::MAX, Ordering::Relaxed);
 
     match tls.close() {
         Ok(mut sock) => sock.shutdown(),

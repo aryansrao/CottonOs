@@ -64,7 +64,7 @@ pub fn execute_command(line: &str) -> String {
     match cmd {
         "help" => {
             if args.is_empty() {
-                String::from("Commands: help, clear, info, mem, df, ps, uptime, echo, sync, reboot, halt\nNetwork:  net, netstats, arptable, arp, ping, dhcp, dns, setip, setmask, setgw, setdns\nTCP:      tcpconnect, tcpsend, tcprecv, tcpclose, httpget, httpsget\nUDP:      udpsend, udprecv\nFiles:    ls, cd, pwd, cat, touch, mkdir, rm, write\n\nFiles are stored persistently on disk (CottonFS).")
+                String::from("Commands: help, clear, info, mem, df, ps, uptime, echo, sync, reboot, halt\nNetwork:  net, netstats, arptable, arp, ping, dhcp, dns, setip, setmask, setgw, setdns\nTCP:      tcpconnect, tcpsend, tcprecv, tcpclose, httpget, httpsget\nUDP:      udpsend, udprecv\nBrowser:  browse <url> - fetch and render a web page\nFiles:    ls, cd, pwd, cat, touch, mkdir, rm, write\n\nFiles are stored persistently on disk (CottonFS).")
             } else {
                 exec_help_detail(args[0])
             }
@@ -94,6 +94,7 @@ pub fn execute_command(line: &str) -> String {
         "tcpclose" => exec_tcpclose(),
         "httpget" => exec_httpget(args),
         "httpsget" => exec_httpsget(args),
+        "browse" => exec_browse(args),
         "udpsend" => exec_udpsend(args),
         "udprecv" => exec_udprecv(),
         "panic" => { panic!("User-triggered panic"); }
@@ -145,6 +146,7 @@ fn exec_help_detail(cmd: &str) -> String {
         "tcpclose" => String::from("tcpclose - Close active TCP connection"),
         "httpget" => String::from("httpget <host-or-ip> [path] - Basic HTTP GET over TCP (no HTTPS)"),
         "httpsget" => String::from("httpsget <host-or-ip> [path] - HTTPS GET over in-kernel TLS"),
+        "browse" => String::from("browse <url> - Fetch and render a web page as text (supports http:// and https://)"),
         "udpsend" => String::from("udpsend <ip> <src_port> <dst_port> <text> - Send UDP datagram"),
         "udprecv" => String::from("udprecv - Receive one UDP datagram"),
         "clear" => String::from("clear - Clear the screen"),
@@ -416,23 +418,27 @@ fn exec_httpget(args: &[&str]) -> String {
     }
 
     let mut out = String::new();
+    const MAX_RESP: usize = 65536;
     let read_start = crate::proc::scheduler::ticks();
     let mut last_data_tick = read_start;
     let mut saw_data = false;
 
-    while (crate::proc::scheduler::ticks() - read_start) < 4000 {
+    while crate::proc::scheduler::ticks().wrapping_sub(read_start) < 4000 {
         crate::drivers::network::poll();
         if let Some((buf, len)) = crate::drivers::network::tcp_read() {
             out.push_str(&String::from_utf8_lossy(&buf[..len]));
             saw_data = true;
             last_data_tick = crate::proc::scheduler::ticks();
+            if out.len() >= MAX_RESP {
+                break;
+            }
         }
 
         if !crate::drivers::network::tcp_is_connected() {
             break;
         }
 
-        if saw_data && (crate::proc::scheduler::ticks() - last_data_tick) > 250 {
+        if saw_data && crate::proc::scheduler::ticks().wrapping_sub(last_data_tick) > 250 {
             break;
         }
 
@@ -468,6 +474,34 @@ fn exec_httpsget(args: &[&str]) -> String {
     match crate::crypto::tls::https_get(host, ip, path) {
         Ok(resp) => resp,
         Err(e) => e,
+    }
+}
+
+fn exec_browse(args: &[&str]) -> String {
+    if args.is_empty() {
+        return String::from("browse: usage: browse <url>");
+    }
+    let raw_url = args[0];
+    let url_owned;
+    let url = if raw_url.starts_with("http://") || raw_url.starts_with("https://") {
+        raw_url
+    } else {
+        url_owned = format!("http://{}", raw_url);
+        url_owned.as_str()
+    };
+
+    match crate::browser::fetch_and_render(url) {
+        Ok((text, links)) => {
+            let mut out = text;
+            if !links.is_empty() {
+                out.push_str("\n\n--- Links ---\n");
+                for (i, link) in links.iter().enumerate().take(20) {
+                    out.push_str(&format!("[{}] {}\n", i + 1, link));
+                }
+            }
+            out
+        }
+        Err(e) => format!("browse: {}", e),
     }
 }
 

@@ -57,7 +57,7 @@ const DEFAULT_IP: [u8; 4] = [10, 0, 2, 15];
 const DEFAULT_NETMASK: [u8; 4] = [255, 255, 255, 0];
 const DEFAULT_GATEWAY: [u8; 4] = [10, 0, 2, 2];
 const DEFAULT_DNS: [u8; 4] = [10, 0, 2, 3];
-const TCP_RECV_BUF_SIZE: usize = 32 * 1024;
+const TCP_RECV_BUF_SIZE: usize = 64 * 1024;
 
 const BROADCAST_MAC: [u8; 6] = [0xFF; 6];
 
@@ -1518,51 +1518,62 @@ pub fn dns_resolve_a(host: &str) -> Result<[u8; 4], &'static str> {
     idx += 2;
 
     for dns in dns_targets.iter().copied().take(dns_target_count) {
-        for _attempt in 0..3 {
+        for _attempt in 0..5 {
             let query_id = DNS_ID_GEN.fetch_add(1, Ordering::Relaxed);
             let src_port = 53000u16.wrapping_add(query_id % 1000);
             query[0..2].copy_from_slice(&query_id.to_be_bytes());
 
             let _ = request_arp(dns);
             let _ = request_arp(gateway());
-            udp_send(dns, src_port, 53, &query[..idx])?;
+            if udp_send(dns, src_port, 53, &query[..idx]).is_err() {
+                crate::arch::halt();
+                continue;
+            }
 
-            let deadline = crate::proc::scheduler::ticks() + 1200;
-            while crate::proc::scheduler::ticks() < deadline {
+            let deadline = crate::proc::scheduler::ticks() + 3000;
+            'wait: while crate::proc::scheduler::ticks() < deadline {
                 poll();
-                if let Some((_src_ip, src_port_rx, dst_port, payload, len)) = udp_recv() {
-                    if src_port_rx != 53 || dst_port != src_port || len < 12 {
-                        continue;
-                    }
-                    let resp_id = u16::from_be_bytes([payload[0], payload[1]]);
-                    if resp_id != query_id {
-                        continue;
-                    }
+                // Drain ALL queued UDP packets this poll cycle (not just one)
+                loop {
+                    match udp_recv() {
+                        None => break, // queue empty — wait for next poll
+                        Some((_src_ip, src_port_rx, dst_port, payload, len)) => {
+                            if src_port_rx != 53 || dst_port != src_port || len < 12 {
+                                continue; // discard non-matching, check next in queue
+                            }
+                            let resp_id = u16::from_be_bytes([payload[0], payload[1]]);
+                            if resp_id != query_id {
+                                continue; // stale response from previous query
+                            }
 
-                    let qdcount = u16::from_be_bytes([payload[4], payload[5]]) as usize;
-                    let ancount = u16::from_be_bytes([payload[6], payload[7]]) as usize;
-                    let nscount = u16::from_be_bytes([payload[8], payload[9]]) as usize;
-                    let arcount = u16::from_be_bytes([payload[10], payload[11]]) as usize;
+                            let qdcount = u16::from_be_bytes([payload[4], payload[5]]) as usize;
+                            let ancount = u16::from_be_bytes([payload[6], payload[7]]) as usize;
+                            let nscount = u16::from_be_bytes([payload[8], payload[9]]) as usize;
+                            let arcount = u16::from_be_bytes([payload[10], payload[11]]) as usize;
 
-                    let packet = &payload[..len];
-                    let mut cur = 12usize;
-                    for _ in 0..qdcount {
-                        cur = skip_dns_name(packet, cur).ok_or("dns malformed question")?;
-                        if cur + 4 > len {
-                            return Err("dns malformed question tail");
+                            let packet = &payload[..len];
+                            let mut cur = 12usize;
+                            let mut ok = true;
+                            for _ in 0..qdcount {
+                                if let Some(next) = skip_dns_name(packet, cur) {
+                                    cur = next;
+                                    if cur + 4 <= len { cur += 4; } else { ok = false; break; }
+                                } else { ok = false; break; }
+                            }
+                            if !ok { continue; }
+
+                            if let Ok((next_cur, Some(ip))) = scan_dns_rrs_for_a(packet, cur, ancount) {
+                                return Ok(ip);
+                            } else if let Ok((next_cur, _)) = scan_dns_rrs_for_a(packet, cur, ancount) {
+                                if let Ok((next_cur2, _)) = scan_dns_rrs_for_a(packet, next_cur, nscount) {
+                                    if let Ok((_, Some(ip))) = scan_dns_rrs_for_a(packet, next_cur2, arcount) {
+                                        return Ok(ip);
+                                    }
+                                }
+                            }
+                            // Got a response but no A record — stop waiting, retry
+                            break 'wait;
                         }
-                        cur += 4;
-                    }
-
-                    let (next_cur, answer_a) = scan_dns_rrs_for_a(packet, cur, ancount)?;
-                    if let Some(ip) = answer_a {
-                        return Ok(ip);
-                    }
-
-                    let (next_cur, _ns_a) = scan_dns_rrs_for_a(packet, next_cur, nscount)?;
-                    let (_next_cur, additional_a) = scan_dns_rrs_for_a(packet, next_cur, arcount)?;
-                    if let Some(ip) = additional_a {
-                        return Ok(ip);
                     }
                 }
                 crate::arch::halt();

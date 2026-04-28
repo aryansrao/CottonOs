@@ -22,6 +22,8 @@ pub mod crypto;
 pub mod syscall;
 pub mod sync;
 pub mod shell;
+pub mod browser;
+pub mod task;
 pub mod gui;
 
 use core::panic::PanicInfo;

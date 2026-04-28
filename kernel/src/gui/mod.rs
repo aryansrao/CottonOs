@@ -33,6 +33,35 @@ pub enum WindowContent {
     FileManager(FileManagerState),
     TextEditor(TextEditorState),
     SaveAs(SaveAsState),
+    Browser(BrowserState),
+}
+
+/// Browser window state
+pub struct BrowserState {
+    pub url_input: String,
+    pub url_focused: bool,
+    pub content: String,
+    pub links: Vec<String>,
+    pub scroll_offset: usize,
+    pub status: String,
+    /// Set to trigger a fetch in the next main-loop iteration (so screen shows "Loading..." first)
+    pub pending_url: Option<String>,
+}
+
+impl BrowserState {
+    pub fn new() -> Self {
+        Self {
+            url_input: String::new(),
+            url_focused: true,
+            content: String::from(
+                "Type a URL or search term above and press Enter.\n\nExamples:\n  rust programming  (search)\n  example.com       (open site)\n  http://info.cern.ch\n\nTip: 'u' refocuses the address bar."
+            ),
+            links: Vec::new(),
+            scroll_offset: 0,
+            status: String::from("Ready"),
+            pending_url: None,
+        }
+    }
 }
 
 /// About/System Info state with scroll support
@@ -614,6 +643,7 @@ pub enum IconAction {
     OpenAbout,
     OpenFiles,
     OpenEditor,
+    OpenBrowser,
 }
 
 /// GUI state
@@ -728,7 +758,12 @@ pub fn init() {
         name: String::from("Info"),
         action: IconAction::OpenAbout,
     });
-    
+
+    state.dock_items.push(DockItem {
+        name: String::from("Browser"),
+        action: IconAction::OpenBrowser,
+    });
+
     *GUI.lock() = Some(state);
     kprintln!("[GUI] Modern GUI initialized ({}x{})", width, height);
 }
@@ -887,6 +922,12 @@ fn draw_dock(bb: &BackBuffer) {
                     // Info icon - circle with i
                     bb.fill_circle(item_x + 24, item_y + 24, 14, Color::ACCENT);
                     bb.draw_string(item_x + 20, item_y + 17, "i", Color::WHITE, None);
+                }
+                IconAction::OpenBrowser => {
+                    // Browser icon - globe shape
+                    bb.fill_circle(item_x + 24, item_y + 24, 16, Color::rgb(20, 100, 220));
+                    bb.draw_hline(item_x + 8, item_y + 24, 32, Color::rgb(150, 200, 255));
+                    bb.draw_string(item_x + 17, item_y + 14, "W", Color::WHITE, None);
                 }
             }
             
@@ -1674,6 +1715,103 @@ fn draw_window_content(bb: &BackBuffer, window: &Window) {
                 bb.draw_string(list_x + 12, list_top + 30, "(No subdirectories)", Color::rgb(100, 100, 105), None);
             }
         }
+        WindowContent::Browser(browser) => {
+            let bg = Color::rgb(22, 22, 24);
+            let url_bar_h: u32 = 28;
+            let status_h: u32 = 20;
+
+            bb.fill_rect(content_x, content_y, content_w, content_h, bg);
+
+            // URL / search bar
+            let url_bar_bg = if browser.url_focused {
+                Color::rgb(50, 50, 58)
+            } else {
+                Color::rgb(38, 38, 42)
+            };
+            bb.fill_rect(content_x + 4, content_y + 4, content_w - 8, url_bar_h, url_bar_bg);
+            if browser.url_focused {
+                bb.draw_rect(content_x + 4, content_y + 4, content_w - 8, url_bar_h, Color::ACCENT);
+            }
+            if browser.url_input.is_empty() {
+                // Dim placeholder text
+                let hint = if browser.url_focused {
+                    "Type a URL or search term, then press Enter"
+                } else {
+                    "Click to search or enter a URL"
+                };
+                bb.draw_string(content_x + 10, content_y + 8, hint, Color::TEXT_SECONDARY, Some(url_bar_bg));
+            } else {
+                bb.draw_string(content_x + 10, content_y + 8, &browser.url_input, Color::TEXT_PRIMARY, Some(url_bar_bg));
+            }
+            if browser.url_focused {
+                let cur_x = content_x + 10 + (browser.url_input.len() as u32 * 8);
+                bb.fill_rect(cur_x, content_y + 7, 2, 16, Color::ACCENT);
+            }
+
+            // Content area
+            let text_x = content_x + 8;
+            let text_start_y = content_y + url_bar_h + 8;
+            let text_h = content_h.saturating_sub(url_bar_h + status_h + 16);
+            let line_h: u32 = 14;
+            let char_w: u32 = 8;
+            let max_chars = ((content_w.saturating_sub(16)) / char_w) as usize;
+            let max_lines = (text_h / line_h) as usize;
+
+            bb.fill_rect(content_x, text_start_y, content_w, text_h, bg);
+
+            // Word-wrap content lines
+            let mut display_lines: Vec<String> = Vec::new();
+            for line in browser.content.lines() {
+                if line.is_empty() {
+                    display_lines.push(String::new());
+                } else {
+                    let mut rem = line;
+                    while !rem.is_empty() {
+                        if rem.len() <= max_chars {
+                            display_lines.push(String::from(rem));
+                            break;
+                        }
+                        let split = rem[..max_chars].rfind(' ').unwrap_or(max_chars);
+                        let (first, rest) = rem.split_at(split);
+                        display_lines.push(String::from(first));
+                        rem = rest.trim_start_matches(' ');
+                    }
+                }
+            }
+
+            let total = display_lines.len();
+            let start = browser.scroll_offset.min(total.saturating_sub(1));
+            let end = (start + max_lines).min(total);
+
+            for (idx, line) in display_lines[start..end].iter().enumerate() {
+                let y = text_start_y + (idx as u32 * line_h);
+                let color = if line.starts_with("  * ") {
+                    Color::rgb(80, 200, 120)
+                } else if line.starts_with("---") || line.starts_with("[") {
+                    Color::rgb(100, 180, 255)
+                } else {
+                    Color::rgb(210, 210, 215)
+                };
+                if !line.is_empty() {
+                    bb.draw_string(text_x, y, line, color, Some(bg));
+                }
+            }
+
+            // Scroll indicator
+            if start > 0 {
+                bb.draw_string(content_x + content_w - 20, text_start_y, "^", Color::TEXT_SECONDARY, Some(bg));
+            }
+
+            // Status bar
+            let status_y = content_y + content_h - status_h;
+            bb.fill_rect(content_x, status_y, content_w, status_h, Color::rgb(32, 32, 36));
+            bb.draw_string(content_x + 8, status_y + 3, &browser.status, Color::TEXT_SECONDARY, None);
+            if !browser.links.is_empty() {
+                let hint = alloc::format!("{} links | u=address bar", browser.links.len());
+                let hint_x = content_x + content_w.saturating_sub((hint.len() as u32 * 8) + 8);
+                bb.draw_string(hint_x, status_y + 3, &hint, Color::TEXT_SECONDARY, None);
+            }
+        }
     }
 }
 
@@ -2380,6 +2518,7 @@ pub fn handle_mouse() {
                                 IconAction::OpenAbout => IconAction::OpenAbout,
                                 IconAction::OpenFiles => IconAction::OpenFiles,
                                 IconAction::OpenEditor => IconAction::OpenEditor,
+                                IconAction::OpenBrowser => IconAction::OpenBrowser,
                             });
                             break;
                         }
@@ -2418,6 +2557,13 @@ pub fn handle_mouse() {
                             let id = state.create_window("Text Editor", 150, 50, 700, 500);
                             if let Some(w) = state.windows.iter_mut().find(|w| w.id == id) {
                                 w.content = WindowContent::TextEditor(TextEditorState::new());
+                            }
+                            state.needs_full_redraw = true;
+                        }
+                        IconAction::OpenBrowser => {
+                            let id = state.create_window("Browser", 80, 40, 780, 540);
+                            if let Some(w) = state.windows.iter_mut().find(|w| w.id == id) {
+                                w.content = WindowContent::Browser(BrowserState::new());
                             }
                             state.needs_full_redraw = true;
                         }
@@ -2642,6 +2788,31 @@ pub fn handle_key_event(event: &crate::drivers::keyboard::KeyEvent) {
                             _ => {}
                         }
                     }
+                    WindowContent::Browser(browser) => {
+                        match event.keycode {
+                            KeyCode::Up => {
+                                browser.scroll_offset = browser.scroll_offset.saturating_sub(1);
+                                state.needs_window_redraw = true;
+                            }
+                            KeyCode::Down => {
+                                browser.scroll_offset += 1;
+                                state.needs_window_redraw = true;
+                            }
+                            KeyCode::PageUp => {
+                                browser.scroll_offset = browser.scroll_offset.saturating_sub(15);
+                                state.needs_window_redraw = true;
+                            }
+                            KeyCode::PageDown => {
+                                browser.scroll_offset += 15;
+                                state.needs_window_redraw = true;
+                            }
+                            KeyCode::Home => {
+                                browser.scroll_offset = 0;
+                                state.needs_window_redraw = true;
+                            }
+                            _ => {}
+                        }
+                    }
                     _ => {}
                 }
                 break;
@@ -2778,6 +2949,41 @@ pub fn handle_keyboard(c: char) {
                         state.needs_window_redraw = true;
                         break;
                     }
+                    WindowContent::Browser(browser) => {
+                        if browser.url_focused {
+                            match c {
+                                '\n' | '\r' => {
+                                    if let Some(url) = crate::browser::build_navigate_url(&browser.url_input) {
+                                        browser.url_input = url.clone();
+                                        browser.url_focused = false;
+                                        // Show loading state now — fetch happens after next screen draw
+                                        browser.content = alloc::format!(
+                                            "Loading: {}\n\nPlease wait...", url
+                                        );
+                                        browser.status = String::from("Fetching...");
+                                        browser.scroll_offset = 0;
+                                        browser.pending_url = Some(url);
+                                    }
+                                }
+                                '\x08' | '\x7f' => {
+                                    browser.url_input.pop();
+                                }
+                                '\x1b' => {
+                                    browser.url_focused = false;
+                                }
+                                ch if ch >= ' ' => {
+                                    browser.url_input.push(ch);
+                                }
+                                _ => {}
+                            }
+                        } else {
+                            if c == 'u' || c == 'U' {
+                                browser.url_focused = true;
+                            }
+                        }
+                        state.needs_window_redraw = true;
+                        break;
+                    }
                     _ => {}
                 }
             }
@@ -2802,6 +3008,82 @@ fn open_file_in_editor(path: &str) {
             w.content = WindowContent::TextEditor(editor);
         }
         state.needs_full_redraw = true;
+    }
+}
+
+/// Service the cooperative browser fetch task.
+///
+/// Lifecycle:
+///   1. GUI sets `browser.pending_url` → screen redraws showing "Loading..."
+///   2. Next call here: starts the network task (`task::start_fetch`)
+///      which returns after the task's first `yield_to_main()`.
+///   3. Subsequent calls: `task::tick_network()` resumes the task for one
+///      cooperative slice (until it yields again).  GUI renders each frame.
+///   4. When task finishes: take result, update browser state, full redraw.
+fn handle_pending_browser_fetch() {
+    use crate::task;
+
+    // ── Phase A: if net task is running, give it a slice and check for done ──
+    if task::is_running() {
+        if task::tick_network() {
+            let (win_id, maybe_result) = task::take_result();
+            if let Some(result) = maybe_result {
+                let mut gui = GUI.lock();
+                if let Some(state) = &mut *gui {
+                    if let Some(w) = state.windows.iter_mut().find(|w| w.id == win_id) {
+                        if let WindowContent::Browser(b) = &mut w.content {
+                            let url = b.url_input.clone();
+                            match result {
+                                Ok((text, links)) => {
+                                    b.content = text;
+                                    b.links = links;
+                                    b.status = alloc::format!("OK — {}", url);
+                                }
+                                Err(e) => {
+                                    b.content = alloc::format!(
+                                        "Could not load page.\n\nError: {}\n\nWorking sites:\n  * http://example.com\n  * http://info.cern.ch\n  * http://wiby.me\n  * http://neverssl.com",
+                                        e
+                                    );
+                                    b.status = alloc::format!("Error: {}", e);
+                                }
+                            }
+                            state.needs_full_redraw = true;
+                        }
+                    }
+                }
+            }
+        }
+        return; // either still running or just finished — don't start another
+    }
+
+    // ── Phase B: start a new fetch if pending_url is set ──────────────────────
+    let start_info: Option<(u32, String)> = {
+        let gui = GUI.lock();
+        gui.as_ref().and_then(|state| {
+            state.windows.iter().rev().find_map(|w| {
+                if let WindowContent::Browser(b) = &w.content {
+                    b.pending_url.as_ref().map(|u| (w.id, u.clone()))
+                } else {
+                    None
+                }
+            })
+        })
+    }; // lock released
+
+    if let Some((win_id, url)) = start_info {
+        // Clear pending_url so we don't re-start next frame
+        {
+            let mut gui = GUI.lock();
+            if let Some(state) = &mut *gui {
+                if let Some(w) = state.windows.iter_mut().find(|w| w.id == win_id) {
+                    if let WindowContent::Browser(b) = &mut w.content {
+                        b.pending_url = None;
+                    }
+                }
+            }
+        }
+        // Start net task — returns after task's first yield_to_main()
+        task::start_fetch(url, win_id);
     }
 }
 
@@ -2859,7 +3141,11 @@ pub fn run() {
         
         // Swap back buffer to screen in one atomic operation
         swap_buffers();
-        
+
+        // Handle any pending browser fetch AFTER the screen shows "Loading..."
+        // This blocks for up to several seconds during network I/O.
+        handle_pending_browser_fetch();
+
         // Small delay
         for _ in 0..3000 {
             core::hint::spin_loop();

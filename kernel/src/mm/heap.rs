@@ -8,11 +8,11 @@ use crate::mm::{PAGE_SIZE, physical};
 /// Heap start address (identity mapped in low memory for early boot)
 const HEAP_START: u64 = 0x0000_0000_0200_0000; // 32MB - well above kernel at 1MB
 
-/// Initial heap size (4MB) - needs to be large enough for GUI back buffer
-const HEAP_SIZE: usize = 4 * 1024 * 1024;
+/// Initial heap size (32MB) - large enough for GUI back buffer + TLS + browser state
+const HEAP_SIZE: usize = 32 * 1024 * 1024;
 
-/// Maximum heap size (16MB)
-const MAX_HEAP_SIZE: usize = 16 * 1024 * 1024;
+/// Maximum heap size (128MB)
+const MAX_HEAP_SIZE: usize = 128 * 1024 * 1024;
 
 /// Global allocator
 #[global_allocator]
