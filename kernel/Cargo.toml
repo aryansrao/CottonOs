@@ -17,6 +17,18 @@ bitflags = "2.4"
 volatile = "0.5"
 linked_list_allocator = "0.10"
 embedded-tls = { version = "0.18", default-features = false, features = ["alloc"] }
+smoltcp = { version = "0.12", default-features = false, features = [
+    "alloc",
+    "medium-ethernet",
+    "proto-ipv4",
+    "proto-dhcpv4",
+    "proto-dns",
+    "socket-tcp",
+    "socket-udp",
+    "socket-dhcpv4",
+    "socket-dns",
+    "socket-icmp",
+] }
 embedded-io = "0.7"
 rand_core = { version = "0.6", default-features = false }
 

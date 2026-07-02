@@ -50,9 +50,13 @@ impl KernelTcpStream {
         crate::drivers::network::tcp_connect(dst_ip, dst_port).map_err(|_| NetIoError::Network)?;
 
         let start = crate::proc::scheduler::ticks();
-        while !crate::drivers::network::tcp_is_connected() && (crate::proc::scheduler::ticks() - start) < 2500 {
-            crate::drivers::network::poll();
-            crate::arch::halt();
+        while !crate::drivers::network::tcp_is_connected() && (crate::proc::scheduler::ticks() - start) < 5000 {
+            // Poll several times before yielding so we catch the SYN-ACK quickly.
+            for _ in 0..8 {
+                crate::drivers::network::poll();
+                if crate::drivers::network::tcp_is_connected() { break; }
+            }
+            crate::task::yield_to_main();
         }
 
         if !crate::drivers::network::tcp_is_connected() {
@@ -78,11 +82,14 @@ impl Read for KernelTcpStream {
             return Ok(0);
         }
         loop {
-            crate::drivers::network::poll();
-
-            let got = crate::drivers::network::tcp_read_into(buf);
-            if got > 0 {
-                return Ok(got);
+            // Poll several times per loop iteration so the TLS handshake (which
+            // issues many small reads) doesn't stall waiting for individual packets.
+            for _ in 0..4 {
+                crate::drivers::network::poll();
+                let got = crate::drivers::network::tcp_read_into(buf);
+                if got > 0 {
+                    return Ok(got);
+                }
             }
 
             if !crate::drivers::network::tcp_is_connected() {
@@ -96,7 +103,7 @@ impl Read for KernelTcpStream {
                 return Err(NetIoError::Timeout);
             }
 
-            crate::arch::halt();
+            crate::task::yield_to_main();
         }
     }
 }
@@ -236,7 +243,7 @@ pub fn https_get(host: &str, ip: [u8; 4], path: &str) -> Result<String, String> 
     // 20-second global deadline for the TLS handshake.
     // After the handshake we reset to 15 seconds for body reading.
     TLS_DEADLINE.store(
-        crate::proc::scheduler::ticks() + 20000,
+        crate::proc::scheduler::ticks() + 30000,
         Ordering::Relaxed,
     );
 

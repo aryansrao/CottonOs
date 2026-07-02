@@ -79,14 +79,30 @@ impl FrameAllocator {
             self.mark_allocated(page);
         }
         
-        // Reserve kernel space (1MB - 2MB typical)
+        // Reserve kernel space. boot_info.kernel_end is a stale hardcoded value
+        // (0x200000) while the linked kernel image (text+data+bss) is larger,
+        // so reserve a generous 1MB..8MB window to keep DMA buffers and page
+        // allocations away from kernel statics.
         let kernel_start = boot_info.kernel_start as usize / PAGE_SIZE;
-        let kernel_end = (boot_info.kernel_end as usize + PAGE_SIZE - 1) / PAGE_SIZE;
-        
+        let kernel_end = ((boot_info.kernel_end as usize).max(0x80_0000) + PAGE_SIZE - 1) / PAGE_SIZE;
+
         if kernel_start > 0 {
             for page in kernel_start..kernel_end {
                 self.mark_allocated(page);
             }
+        }
+
+        // Reserve the kernel heap's identity-mapped physical range. The heap
+        // lives at HEAP_START..HEAP_START+HEAP_SIZE and is identity mapped
+        // (the boot page tables use 2MB huge pages that map_page cannot
+        // split), so these physical frames belong to the heap and must never
+        // be handed out for DMA buffers or page tables.
+        let heap_start_page = crate::mm::heap::HEAP_START as usize / PAGE_SIZE;
+        let heap_end_page = (crate::mm::heap::HEAP_START as usize
+            + crate::mm::heap::HEAP_SIZE)
+            / PAGE_SIZE;
+        for page in heap_start_page..heap_end_page {
+            self.mark_allocated(page);
         }
         
         // Find first free page
@@ -261,6 +277,17 @@ pub fn alloc_frame() -> Option<u64> {
 /// Allocate contiguous physical frames
 pub fn alloc_frames(count: usize) -> Option<u64> {
     FRAME_ALLOCATOR.lock().alloc_contiguous(count)
+}
+
+/// Reserve an identity-mapped physical range (e.g. heap growth) so the
+/// frame allocator never hands it out.
+pub fn reserve_range(start: u64, end: u64) {
+    let mut allocator = FRAME_ALLOCATOR.lock();
+    let start_page = start as usize / PAGE_SIZE;
+    let end_page = (end as usize + PAGE_SIZE - 1) / PAGE_SIZE;
+    for page in start_page..end_page {
+        allocator.mark_allocated(page);
+    }
 }
 
 /// Free a physical frame

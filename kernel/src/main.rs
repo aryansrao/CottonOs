@@ -136,6 +136,37 @@ pub extern "C" fn _start64(multiboot_info: u64) -> ! {
                     break;
                 }
                 
+                // Memory map tag (type 6)
+                // Each entry: u64 base_addr, u64 length, u32 type, u32 reserved
+                if tag_type == 6 {
+                    early_serial_write(b"Found memory map tag!\r\n");
+                    let entry_size = *((addr + 8) as *const u32);
+                    if entry_size > 0 && tag_size > 16 {
+                        let n_entries = ((tag_size - 16) / entry_size) as usize;
+                        let mut count = 0usize;
+                        for i in 0..n_entries {
+                            if count >= MAX_MMAP_ENTRIES { break; }
+                            let e = addr + 16 + (i as u64 * entry_size as u64);
+                            let base   = *(e as *const u64);
+                            let length = *((e + 8) as *const u64);
+                            let mtype  = *((e + 16) as *const u32);
+                            BOOT_MMAP[count] = mm::MemoryMapEntry {
+                                base,
+                                length,
+                                mem_type: match mtype {
+                                    1 => mm::MemoryType::Available,
+                                    3 => mm::MemoryType::AcpiReclaimable,
+                                    4 => mm::MemoryType::AcpiNvs,
+                                    5 => mm::MemoryType::BadMemory,
+                                    _ => mm::MemoryType::Reserved,
+                                },
+                            };
+                            count += 1;
+                        }
+                        BOOT_MMAP_COUNT = count;
+                    }
+                }
+
                 // Framebuffer info tag (type 8)
                 if tag_type == 8 {
                     early_serial_write(b"Found framebuffer tag!\r\n");
@@ -241,8 +272,8 @@ pub extern "C" fn _start64(multiboot_info: u64) -> ! {
     // Create boot info with framebuffer
     let boot_info = BootInfo {
         magic: multiboot_info,
-        memory_map: core::ptr::null(),
-        memory_map_entries: 0,
+        memory_map: unsafe { if BOOT_MMAP_COUNT > 0 { BOOT_MMAP.as_ptr() } else { core::ptr::null() } },
+        memory_map_entries: unsafe { BOOT_MMAP_COUNT },
         framebuffer: FramebufferInfo {
             address: framebuffer_addr,
             width: framebuffer_width,
@@ -377,6 +408,16 @@ impl Architecture {
 
 /// Static flag to track if kernel has been initialized
 static KERNEL_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+/// Static buffer to hold the parsed Multiboot2 memory map before the heap is up.
+const MAX_MMAP_ENTRIES: usize = 64;
+const EMPTY_MMAP_ENTRY: mm::MemoryMapEntry = mm::MemoryMapEntry {
+    base: 0,
+    length: 0,
+    mem_type: mm::MemoryType::Reserved,
+};
+static mut BOOT_MMAP: [mm::MemoryMapEntry; MAX_MMAP_ENTRIES] = [EMPTY_MMAP_ENTRY; MAX_MMAP_ENTRIES];
+static mut BOOT_MMAP_COUNT: usize = 0;
 
 /// Kernel main entry point
 /// Called by architecture-specific entry code

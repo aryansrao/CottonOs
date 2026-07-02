@@ -124,10 +124,10 @@ fn http_get_raw(host: &str, path: &str) -> Result<String, String> {
 
     let start = crate::proc::scheduler::ticks();
     while !crate::drivers::network::tcp_is_connected()
-        && crate::proc::scheduler::ticks() - start < 1500
+        && crate::proc::scheduler::ticks() - start < 8000
     {
         crate::drivers::network::poll();
-        crate::arch::halt();
+        crate::task::yield_to_main();
     }
     if !crate::drivers::network::tcp_is_connected() {
         let _ = crate::drivers::network::tcp_close();
@@ -160,10 +160,10 @@ fn http_get_raw(host: &str, path: &str) -> Result<String, String> {
         if !crate::drivers::network::tcp_is_connected() {
             break;
         }
-        if saw_data && crate::proc::scheduler::ticks() - last_data > 400 {
+        if saw_data && crate::proc::scheduler::ticks() - last_data > 800 {
             break;
         }
-        crate::arch::halt();
+        crate::task::yield_to_main();
     }
 
     let _ = crate::drivers::network::tcp_close();
