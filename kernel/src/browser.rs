@@ -3,6 +3,226 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 const MAX_RESPONSE: usize = 65536;
+const MAX_LINKS: usize = 300;
+
+// ─── Styled document model ────────────────────────────────────────────────────
+//
+// The HTML renderer produces a `Document`: a list of logical lines, each made
+// of styled spans. The GUI lays these out (word wrap) and can hit-test link
+// spans for clicking; the shell flattens them to plain text.
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SpanStyle {
+    Normal,
+    Heading,
+    Bold,
+    Pre,
+    Bullet,
+}
+
+#[derive(Clone)]
+pub struct DocSpan {
+    pub text: String,
+    pub style: SpanStyle,
+    /// Index into `Document::links`
+    pub link: Option<u16>,
+}
+
+pub type DocLine = Vec<DocSpan>;
+
+#[derive(Clone, Default)]
+pub struct Document {
+    pub lines: Vec<DocLine>,
+    pub links: Vec<String>,
+}
+
+impl Document {
+    pub fn from_text(text: &str) -> Self {
+        let lines = text
+            .lines()
+            .map(|l| {
+                if l.is_empty() {
+                    Vec::new()
+                } else {
+                    alloc::vec![DocSpan {
+                        text: String::from(l),
+                        style: SpanStyle::Normal,
+                        link: None,
+                    }]
+                }
+            })
+            .collect();
+        Self {
+            lines,
+            links: Vec::new(),
+        }
+    }
+
+    /// Flatten to plain text (shell `browse` command).
+    pub fn to_text(&self) -> String {
+        let mut out = String::new();
+        for line in &self.lines {
+            for span in line {
+                out.push_str(&span.text);
+            }
+            out.push('\n');
+        }
+        out
+    }
+}
+
+/// A span placed by the word-wrap layout: `col` is the character column on
+/// its visual line (monospace 8px grid).
+pub struct LaidSpan {
+    pub col: usize,
+    pub text: String,
+    pub style: SpanStyle,
+    pub link: Option<u16>,
+}
+
+/// Word-wrap a document to `max_chars` columns.
+pub fn layout(doc: &Document, max_chars: usize) -> Vec<Vec<LaidSpan>> {
+    let max_chars = max_chars.max(10);
+    let mut out: Vec<Vec<LaidSpan>> = Vec::new();
+
+    for line in &doc.lines {
+        if line.is_empty() {
+            out.push(Vec::new());
+            continue;
+        }
+
+        let mut visual: Vec<LaidSpan> = Vec::new();
+        let mut col = 0usize;
+
+        for span in line {
+            let mut run = String::new();
+            let mut run_col = col;
+
+            let mut flush =
+                |run: &mut String, run_col: usize, visual: &mut Vec<LaidSpan>| {
+                    if !run.is_empty() {
+                        visual.push(LaidSpan {
+                            col: run_col,
+                            text: core::mem::take(run),
+                            style: span.style,
+                            link: span.link,
+                        });
+                    }
+                };
+
+            // Tokenize into whitespace runs and words
+            let bytes = span.text.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                let is_space = bytes[i] == b' ';
+                let mut j = i;
+                while j < bytes.len() && (bytes[j] == b' ') == is_space {
+                    j += 1;
+                }
+                let token = &span.text[i..j];
+                i = j;
+
+                if is_space {
+                    if col + token.len() <= max_chars {
+                        run.push_str(token);
+                        col += token.len();
+                    } else {
+                        // Space at line edge: break the line, drop the spaces
+                        flush(&mut run, run_col, &mut visual);
+                        out.push(core::mem::take(&mut visual));
+                        col = 0;
+                        run_col = 0;
+                    }
+                } else {
+                    let mut word = token;
+                    loop {
+                        if col + word.len() <= max_chars {
+                            run.push_str(word);
+                            col += word.len();
+                            break;
+                        }
+                        if col > 0 {
+                            // Doesn't fit on this line: wrap
+                            flush(&mut run, run_col, &mut visual);
+                            out.push(core::mem::take(&mut visual));
+                            col = 0;
+                            run_col = 0;
+                            // strip the leading spaces that may be in `run` (none: run flushed)
+                            continue;
+                        }
+                        // Word longer than the whole line: hard split
+                        let (head, tail) = word.split_at(max_chars);
+                        run.push_str(head);
+                        flush(&mut run, run_col, &mut visual);
+                        out.push(core::mem::take(&mut visual));
+                        col = 0;
+                        run_col = 0;
+                        word = tail;
+                        if word.is_empty() {
+                            break;
+                        }
+                    }
+                }
+            }
+            flush(&mut run, run_col, &mut visual);
+        }
+
+        out.push(visual);
+    }
+
+    out
+}
+
+/// Resolve an href against the page's URL. Returns None for schemes and
+/// fragments the browser can't follow.
+pub fn resolve_url(base: &str, href: &str) -> Option<String> {
+    let href = href.trim();
+    if href.is_empty()
+        || href.starts_with('#')
+        || href.starts_with("javascript:")
+        || href.starts_with("mailto:")
+        || href.starts_with("data:")
+        || href.starts_with("tel:")
+    {
+        return None;
+    }
+
+    // Strip fragment
+    let href = href.split('#').next().unwrap_or(href);
+    if href.is_empty() {
+        return None;
+    }
+
+    if href.starts_with("http://") || href.starts_with("https://") {
+        return Some(String::from(href));
+    }
+
+    let (scheme, rest) = if let Some(r) = base.strip_prefix("https://") {
+        ("https", r)
+    } else if let Some(r) = base.strip_prefix("http://") {
+        ("http", r)
+    } else {
+        ("http", base)
+    };
+    let host_end = rest.find('/').unwrap_or(rest.len());
+    let host = &rest[..host_end];
+    if host.is_empty() {
+        return None;
+    }
+
+    if let Some(r) = href.strip_prefix("//") {
+        return Some(format!("{}://{}", scheme, r));
+    }
+    if href.starts_with('/') {
+        return Some(format!("{}://{}{}", scheme, host, href));
+    }
+
+    // Relative to the base path's directory
+    let base_path = &rest[host_end..];
+    let dir_end = base_path.rfind('/').map(|i| i + 1).unwrap_or(0);
+    let dir = if dir_end == 0 { "/" } else { &base_path[..dir_end] };
+    Some(format!("{}://{}{}{}", scheme, host, dir, href))
+}
 
 // ─── Public URL / search helpers ─────────────────────────────────────────────
 
@@ -48,8 +268,9 @@ pub fn url_encode_query(s: &str) -> String {
 
 // ─── Fetch + render ───────────────────────────────────────────────────────────
 
-/// Fetch a URL (following up to 4 redirects) and render to plain text + links.
-pub fn fetch_and_render(url: &str) -> Result<(String, Vec<String>), String> {
+/// Fetch a URL (following up to 4 redirects) and render to a styled Document.
+/// Links inside the document are resolved against the final URL.
+pub fn fetch_and_render(url: &str) -> Result<Document, String> {
     let mut current = String::from(url);
 
     for _ in 0..5 {
@@ -88,8 +309,7 @@ pub fn fetch_and_render(url: &str) -> Result<(String, Vec<String>), String> {
             raw_body
         };
 
-        let (_, host, _) = split_url(&current);
-        return Ok(render_html(host, body));
+        return Ok(render_html_doc(&current, body));
     }
 
     Err(String::from("Too many redirects (site may require HTTPS)"))
@@ -250,13 +470,160 @@ fn decode_chunked(body: &str) -> String {
 
 // ─── HTML renderer ────────────────────────────────────────────────────────────
 
-/// Convert an HTML body to plain text + a list of absolute links.
-pub fn render_html(host: &str, body: &str) -> (String, Vec<String>) {
-    let _ = host;
-    let mut out = String::new();
-    let mut links: Vec<String> = Vec::new();
+struct DocBuilder {
+    lines: Vec<DocLine>,
+    cur: DocLine,
+    text: String,
+    links: Vec<String>,
+    cur_link: Option<u16>,
+    heading: u32,
+    bold: u32,
+    pre: bool,
+    last_space: bool,
+}
+
+impl DocBuilder {
+    fn new() -> Self {
+        Self {
+            lines: Vec::new(),
+            cur: Vec::new(),
+            text: String::new(),
+            links: Vec::new(),
+            cur_link: None,
+            heading: 0,
+            bold: 0,
+            pre: false,
+            last_space: true,
+        }
+    }
+
+    fn style(&self) -> SpanStyle {
+        if self.heading > 0 {
+            SpanStyle::Heading
+        } else if self.pre {
+            SpanStyle::Pre
+        } else if self.bold > 0 {
+            SpanStyle::Bold
+        } else {
+            SpanStyle::Normal
+        }
+    }
+
+    fn flush_span(&mut self) {
+        if self.text.is_empty() {
+            return;
+        }
+        let text = core::mem::take(&mut self.text);
+        self.cur.push(DocSpan {
+            text,
+            style: self.style(),
+            link: self.cur_link,
+        });
+    }
+
+    fn line_has_content(&self) -> bool {
+        !self.text.trim().is_empty()
+            || self.cur.iter().any(|s| !s.text.trim().is_empty())
+    }
+
+    fn newline(&mut self) {
+        self.flush_span();
+        self.lines.push(core::mem::take(&mut self.cur));
+        self.last_space = true;
+    }
+
+    /// End the current line (if it has content) and ensure one blank line.
+    fn blank_line(&mut self) {
+        if self.line_has_content() {
+            self.newline();
+        }
+        if self.lines.last().map_or(false, |l| !l.is_empty()) {
+            self.lines.push(Vec::new());
+        }
+        self.cur.clear();
+        self.text.clear();
+        self.last_space = true;
+    }
+
+    /// End the current line only if it already has content.
+    fn break_line(&mut self) {
+        if self.line_has_content() {
+            self.newline();
+        } else {
+            self.cur.clear();
+            self.text.clear();
+            self.last_space = true;
+        }
+    }
+
+    fn push_char(&mut self, ch: char) {
+        if self.pre {
+            match ch {
+                '\n' => self.newline(),
+                '\r' => {}
+                '\t' => self.text.push_str("    "),
+                _ => self.text.push(ch),
+            }
+            self.last_space = false;
+            return;
+        }
+        match ch {
+            ' ' | '\n' | '\r' | '\t' => {
+                if !self.last_space {
+                    self.text.push(' ');
+                    self.last_space = true;
+                }
+            }
+            _ => {
+                self.text.push(ch);
+                self.last_space = false;
+            }
+        }
+    }
+
+    fn push_str(&mut self, s: &str) {
+        for ch in s.chars() {
+            self.push_char(ch);
+        }
+    }
+
+    fn start_link(&mut self, url: String) {
+        if self.links.len() >= MAX_LINKS {
+            return;
+        }
+        self.flush_span();
+        self.links.push(url);
+        self.cur_link = Some((self.links.len() - 1) as u16);
+    }
+
+    fn end_link(&mut self) {
+        self.flush_span();
+        self.cur_link = None;
+    }
+
+    fn finish(mut self) -> Document {
+        self.flush_span();
+        if !self.cur.is_empty() {
+            self.lines.push(self.cur);
+        }
+        // Trim trailing empty lines
+        while self.lines.last().map_or(false, |l| l.is_empty()) {
+            self.lines.pop();
+        }
+        Document {
+            lines: self.lines,
+            links: self.links,
+        }
+    }
+}
+
+/// Convert an HTML body to a styled Document with links resolved against
+/// `base_url`.
+pub fn render_html_doc(base_url: &str, body: &str) -> Document {
+    let mut b = DocBuilder::new();
     let mut in_script = false;
     let mut in_style = false;
+    let mut in_title = false;
 
     let src = body.as_bytes();
     let n = src.len();
@@ -287,46 +654,43 @@ pub fn render_html(host: &str, body: &str) -> (String, Vec<String>) {
                     in_style = true;
                 } else if tci(name, "/style") {
                     in_style = false;
+                } else if tci(name, "title") {
+                    in_title = true;
+                } else if tci(name, "/title") {
+                    in_title = false;
                 } else if !in_script && !in_style {
-                    process_tag(name, tag_raw, &mut out, &mut links);
+                    process_tag(&mut b, name, tag_raw, base_url);
                 }
             }
             i = j + 1;
-        } else if src[i] == b'&' && !in_script && !in_style {
-            i += decode_entity(&src[i..], &mut out);
-        } else if !in_script && !in_style {
-            let b = src[i];
-            let seq = if b < 0x80 {
+        } else if in_script || in_style || in_title {
+            i += 1;
+        } else if src[i] == b'&' {
+            let (consumed, ch) = decode_entity(&src[i..]);
+            if let Some(ch) = ch {
+                b.push_char(ch);
+            }
+            i += consumed;
+        } else {
+            let byte = src[i];
+            let seq = if byte < 0x80 {
                 1
-            } else if b & 0xE0 == 0xC0 {
+            } else if byte & 0xE0 == 0xC0 {
                 2
-            } else if b & 0xF0 == 0xE0 {
+            } else if byte & 0xF0 == 0xE0 {
                 3
             } else {
                 4
             };
             let end = (i + seq).min(n);
             if let Ok(s) = core::str::from_utf8(&src[i..end]) {
-                for ch in s.chars() {
-                    match ch {
-                        '\n' | '\r' | '\t' => {
-                            if !out.ends_with(' ') && !out.ends_with('\n') {
-                                out.push(' ');
-                            }
-                        }
-                        _ => out.push(ch),
-                    }
-                }
+                b.push_str(s);
             }
             i = end;
-        } else {
-            i += 1;
         }
     }
 
-    let trim = out.trim_end().len();
-    out.truncate(trim);
-    (out, links)
+    b.finish()
 }
 
 // ─── Tag helpers ─────────────────────────────────────────────────────────────
@@ -339,52 +703,65 @@ fn tci(tag: &str, name: &str) -> bool {
             .all(|(a, b)| a.to_ascii_lowercase() == b)
 }
 
-fn process_tag(name: &str, raw: &str, out: &mut String, links: &mut Vec<String>) {
+fn process_tag(b: &mut DocBuilder, name: &str, raw: &str, base_url: &str) {
     if tci(name, "br") || tci(name, "br/") {
-        out.push('\n');
-    } else if is_block(name) {
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
+        b.newline();
     } else if tci(name, "h1") || tci(name, "h2") || tci(name, "h3") {
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push('\n');
-    } else if tci(name, "/h1")
-        || tci(name, "/h2")
-        || tci(name, "/h3")
-        || tci(name, "h4")
-        || tci(name, "/h4")
-        || tci(name, "h5")
-        || tci(name, "/h5")
-        || tci(name, "h6")
-        || tci(name, "/h6")
-    {
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
+        b.blank_line();
+        b.heading += 1;
+    } else if tci(name, "/h1") || tci(name, "/h2") || tci(name, "/h3") {
+        b.heading = b.heading.saturating_sub(1);
+        b.break_line();
+    } else if tci(name, "h4") || tci(name, "h5") || tci(name, "h6") {
+        b.break_line();
+        b.bold += 1;
+    } else if tci(name, "/h4") || tci(name, "/h5") || tci(name, "/h6") {
+        b.bold = b.bold.saturating_sub(1);
+        b.break_line();
+    } else if tci(name, "p") {
+        b.blank_line();
+    } else if tci(name, "/p") || tci(name, "tr") || tci(name, "/li") || is_block(name) {
+        b.break_line();
     } else if tci(name, "li") {
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push_str("  * ");
-    } else if tci(name, "/li") {
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-    } else if tci(name, "tr") {
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
+        b.break_line();
+        b.flush_span();
+        b.cur.push(DocSpan {
+            text: String::from("  * "),
+            style: SpanStyle::Bullet,
+            link: None,
+        });
+        b.last_space = true;
     } else if tci(name, "td") || tci(name, "th") {
-        out.push_str("  ");
-    } else if tci(name, "a") && links.len() < 30 {
+        b.push_str("  ");
+    } else if tci(name, "hr") || tci(name, "hr/") {
+        b.break_line();
+        b.flush_span();
+        b.cur.push(DocSpan {
+            text: String::from("----------------------------------------"),
+            style: SpanStyle::Bullet,
+            link: None,
+        });
+        b.newline();
+    } else if tci(name, "pre") {
+        b.blank_line();
+        b.pre = true;
+    } else if tci(name, "/pre") {
+        b.pre = false;
+        b.break_line();
+    } else if tci(name, "b") || tci(name, "strong") || tci(name, "em") || tci(name, "i") {
+        b.flush_span();
+        b.bold += 1;
+    } else if tci(name, "/b") || tci(name, "/strong") || tci(name, "/em") || tci(name, "/i") {
+        b.flush_span();
+        b.bold = b.bold.saturating_sub(1);
+    } else if tci(name, "a") {
         if let Some(href) = extract_href(raw) {
-            if href.starts_with("http") {
-                links.push(href);
+            if let Some(url) = resolve_url(base_url, &href) {
+                b.start_link(url);
             }
         }
+    } else if tci(name, "/a") {
+        b.end_link();
     }
 }
 
@@ -415,46 +792,56 @@ fn is_block(name: &str) -> bool {
         || tci(name, "/form")
 }
 
-fn decode_entity(src: &[u8], out: &mut String) -> usize {
-    if src.starts_with(b"&amp;") {
-        out.push('&');
-        return 5;
+/// Decode one HTML entity at the start of `src`.
+/// Returns (bytes consumed, decoded char if any).
+fn decode_entity(src: &[u8]) -> (usize, Option<char>) {
+    const NAMED: &[(&[u8], char)] = &[
+        (b"&amp;", '&'),
+        (b"&lt;", '<'),
+        (b"&gt;", '>'),
+        (b"&nbsp;", ' '),
+        (b"&quot;", '"'),
+        (b"&apos;", '\''),
+        (b"&mdash;", '-'),
+        (b"&ndash;", '-'),
+        (b"&hellip;", '.'),
+        (b"&copy;", 'c'),
+        (b"&middot;", '*'),
+        (b"&bull;", '*'),
+        (b"&rsquo;", '\''),
+        (b"&lsquo;", '\''),
+        (b"&rdquo;", '"'),
+        (b"&ldquo;", '"'),
+    ];
+    for (pat, ch) in NAMED {
+        if src.starts_with(pat) {
+            return (pat.len(), Some(*ch));
+        }
     }
-    if src.starts_with(b"&lt;") {
-        out.push('<');
-        return 4;
-    }
-    if src.starts_with(b"&gt;") {
-        out.push('>');
-        return 4;
-    }
-    if src.starts_with(b"&nbsp;") {
-        out.push(' ');
-        return 6;
-    }
-    if src.starts_with(b"&quot;") {
-        out.push('"');
-        return 6;
-    }
-    if src.starts_with(b"&apos;") {
-        out.push('\'');
-        return 6;
-    }
-    if src.starts_with(b"&#39;") {
-        out.push('\'');
-        return 5;
-    }
+
+    // Numeric: &#123; or &#xAB;
     if src.starts_with(b"&#") {
-        let mut k = 2usize;
-        while k < src.len() && src[k] != b';' && k < 12 {
+        let hex = src.len() > 2 && (src[2] == b'x' || src[2] == b'X');
+        let digits_start = if hex { 3 } else { 2 };
+        let mut k = digits_start;
+        let mut value: u32 = 0;
+        while k < src.len() && k < digits_start + 8 {
+            let d = src[k];
+            let digit = match d {
+                b'0'..=b'9' => (d - b'0') as u32,
+                b'a'..=b'f' if hex => (d - b'a' + 10) as u32,
+                b'A'..=b'F' if hex => (d - b'A' + 10) as u32,
+                _ => break,
+            };
+            value = value * (if hex { 16 } else { 10 }) + digit;
             k += 1;
         }
-        if k < src.len() {
-            return k + 1;
+        if k > digits_start && k < src.len() && src[k] == b';' {
+            return (k + 1, char::from_u32(value));
         }
     }
-    out.push('&');
-    1
+
+    (1, Some('&'))
 }
 
 fn extract_href(tag: &str) -> Option<String> {

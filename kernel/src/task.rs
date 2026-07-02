@@ -7,8 +7,9 @@
 //! stack, swaps RSP, restores the other task's registers, returns.
 
 use alloc::string::String;
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+use crate::browser::Document;
 
 /// Dedicated stack for the network task (128 KB — enough for TLS + HTTP).
 const NET_STACK_SIZE: usize = 131072;
@@ -94,7 +95,7 @@ static NET_DONE:    AtomicBool = AtomicBool::new(false);
 static NET_WIN_ID:  AtomicU32  = AtomicU32::new(0);
 
 static mut PENDING_URL:   Option<String> = None;
-static mut FETCH_RESULT:  Option<Result<(String, Vec<String>), String>> = None;
+static mut FETCH_RESULT:  Option<Result<Document, String>> = None;
 
 // ── net task entry ────────────────────────────────────────────────────────────
 
@@ -153,7 +154,7 @@ pub fn tick_network() -> bool {
 
 /// Take the result after `tick_network()` returns `true`.
 /// Returns `(win_id, Option<result>)`.
-pub fn take_result() -> (u32, Option<Result<(String, Vec<String>), String>>) {
+pub fn take_result() -> (u32, Option<Result<Document, String>>) {
     NET_RUNNING.store(false, Ordering::SeqCst);
     NET_DONE.store(false, Ordering::SeqCst);
     let win_id = NET_WIN_ID.load(Ordering::SeqCst);

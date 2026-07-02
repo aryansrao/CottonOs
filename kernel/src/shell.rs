@@ -491,11 +491,11 @@ fn exec_browse(args: &[&str]) -> String {
     };
 
     match crate::browser::fetch_and_render(url) {
-        Ok((text, links)) => {
-            let mut out = text;
-            if !links.is_empty() {
+        Ok(doc) => {
+            let mut out = doc.to_text();
+            if !doc.links.is_empty() {
                 out.push_str("\n\n--- Links ---\n");
-                for (i, link) in links.iter().enumerate().take(20) {
+                for (i, link) in doc.links.iter().enumerate().take(20) {
                     out.push_str(&format!("[{}] {}\n", i + 1, link));
                 }
             }

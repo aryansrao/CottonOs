@@ -40,8 +40,17 @@ pub enum WindowContent {
 pub struct BrowserState {
     pub url_input: String,
     pub url_focused: bool,
-    pub content: String,
-    pub links: Vec<String>,
+    /// Styled page content
+    pub doc: crate::browser::Document,
+    /// Word-wrapped layout of `doc`, cached per width
+    pub layout: Vec<Vec<crate::browser::LaidSpan>>,
+    pub layout_width: usize,
+    /// Screen-space rectangles of visible link spans: (x, y, w, h, link index)
+    pub link_rects: Vec<(i32, i32, i32, i32, u16)>,
+    /// Previously visited URLs (for the back button)
+    pub history: Vec<String>,
+    /// URL of the page currently displayed (set on successful fetch)
+    pub current_url: String,
     pub scroll_offset: usize,
     pub status: String,
     /// Set to trigger a fetch in the next main-loop iteration (so screen shows "Loading..." first)
@@ -53,13 +62,58 @@ impl BrowserState {
         Self {
             url_input: String::new(),
             url_focused: true,
-            content: String::from(
-                "Type a URL or search term above and press Enter.\n\nExamples:\n  rust programming  (search)\n  example.com       (open site)\n  http://info.cern.ch\n\nTip: 'u' refocuses the address bar."
+            doc: crate::browser::Document::from_text(
+                "Type a URL or search term above and press Enter.\n\nExamples:\n  rust programming  (search)\n  example.com       (open site)\n  http://info.cern.ch\n\nClick links to follow them. '<' or Backspace goes back.\nScroll with the mouse wheel, arrows or PgUp/PgDn.\n'u' refocuses the address bar."
             ),
-            links: Vec::new(),
+            layout: Vec::new(),
+            layout_width: 0,
+            link_rects: Vec::new(),
+            history: Vec::new(),
+            current_url: String::new(),
             scroll_offset: 0,
             status: String::from("Ready"),
             pending_url: None,
+        }
+    }
+
+    /// Replace the page content and invalidate layout caches.
+    pub fn set_doc(&mut self, doc: crate::browser::Document) {
+        self.doc = doc;
+        self.layout.clear();
+        self.layout_width = 0;
+        self.link_rects.clear();
+        self.scroll_offset = 0;
+    }
+
+    /// Navigate to a URL, remembering the current page for back.
+    pub fn navigate(&mut self, url: String) {
+        if !self.current_url.is_empty() && self.current_url != url {
+            self.history.push(self.current_url.clone());
+        }
+        self.url_input = url.clone();
+        self.url_focused = false;
+        self.set_doc(crate::browser::Document::from_text(&alloc::format!(
+            "Loading: {}\n\nPlease wait...",
+            url
+        )));
+        self.status = String::from("Fetching...");
+        self.pending_url = Some(url);
+    }
+
+    /// Go back one page. Returns true if a navigation started.
+    pub fn go_back(&mut self) -> bool {
+        if let Some(prev) = self.history.pop() {
+            self.url_input = prev.clone();
+            self.url_focused = false;
+            self.set_doc(crate::browser::Document::from_text(&alloc::format!(
+                "Loading: {}\n\nPlease wait...",
+                prev
+            )));
+            self.status = String::from("Fetching...");
+            self.pending_url = Some(prev);
+            true
+        } else {
+            false
         }
     }
 }
@@ -944,6 +998,66 @@ fn draw_dock(bb: &BackBuffer) {
 }
 
 /// Draw all windows
+/// Browser text metrics (8x16 font drawn on a 14px line grid)
+const BROWSER_LINE_H: u32 = 14;
+const BROWSER_CHAR_W: u32 = 8;
+
+/// Recompute browser word-wrap layouts and clickable-link rectangles.
+/// Runs once per frame before drawing; mouse clicks hit-test against the
+/// rectangles produced here.
+fn prepare_browser_layouts() {
+    let mut gui = GUI.lock();
+    if let Some(state) = &mut *gui {
+        for window in state.windows.iter_mut() {
+            if !window.visible {
+                continue;
+            }
+            let (wx, wy, ww, wh) = (window.x, window.y, window.width, window.height);
+            if let WindowContent::Browser(browser) = &mut window.content {
+                let content_x = wx + 1;
+                let content_y = wy + 32;
+                let content_w = ww.saturating_sub(2);
+                let content_h = wh.saturating_sub(33);
+
+                let url_bar_h: u32 = 28;
+                let status_h: u32 = 20;
+                let text_x = content_x + 8;
+                let text_y = content_y + (url_bar_h + 8) as i32;
+                let text_h = content_h.saturating_sub(url_bar_h + status_h + 16);
+                let max_chars = (content_w.saturating_sub(16) / BROWSER_CHAR_W) as usize;
+                let max_lines = (text_h / BROWSER_LINE_H) as usize;
+
+                if browser.layout_width != max_chars {
+                    browser.layout = crate::browser::layout(&browser.doc, max_chars);
+                    browser.layout_width = max_chars;
+                }
+
+                // Clamp scrolling to the document
+                let max_scroll = browser.layout.len().saturating_sub(max_lines);
+                if browser.scroll_offset > max_scroll {
+                    browser.scroll_offset = max_scroll;
+                }
+
+                // Rebuild link hit-rectangles for the visible rows
+                browser.link_rects.clear();
+                let total = browser.layout.len();
+                let start = browser.scroll_offset.min(total.saturating_sub(1));
+                let end = (start + max_lines).min(total);
+                for (row, line) in browser.layout[start..end].iter().enumerate() {
+                    let y = text_y + (row as u32 * BROWSER_LINE_H) as i32;
+                    for span in line {
+                        if let Some(link) = span.link {
+                            let x = text_x + (span.col as u32 * BROWSER_CHAR_W) as i32;
+                            let w = (span.text.len() as u32 * BROWSER_CHAR_W) as i32;
+                            browser.link_rects.push((x, y, w, BROWSER_LINE_H as i32, link));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn draw_windows(bb: &BackBuffer) {
     let gui = GUI.lock();
     if let Some(state) = &*gui {
@@ -1719,95 +1833,121 @@ fn draw_window_content(bb: &BackBuffer, window: &Window) {
             let bg = Color::rgb(22, 22, 24);
             let url_bar_h: u32 = 28;
             let status_h: u32 = 20;
+            let back_w: u32 = 26;
 
             bb.fill_rect(content_x, content_y, content_w, content_h, bg);
 
+            // Back button
+            let back_bg = if browser.history.is_empty() {
+                Color::rgb(32, 32, 36)
+            } else {
+                Color::rgb(48, 48, 54)
+            };
+            let back_fg = if browser.history.is_empty() {
+                Color::rgb(90, 90, 95)
+            } else {
+                Color::TEXT_PRIMARY
+            };
+            bb.fill_rect(content_x + 4, content_y + 4, back_w, url_bar_h, back_bg);
+            bb.draw_string(content_x + 4 + 9, content_y + 10, "<", back_fg, Some(back_bg));
+
             // URL / search bar
+            let url_x = content_x + 4 + back_w + 4;
+            let url_w = content_w.saturating_sub(8 + back_w + 4);
             let url_bar_bg = if browser.url_focused {
                 Color::rgb(50, 50, 58)
             } else {
                 Color::rgb(38, 38, 42)
             };
-            bb.fill_rect(content_x + 4, content_y + 4, content_w - 8, url_bar_h, url_bar_bg);
+            bb.fill_rect(url_x, content_y + 4, url_w, url_bar_h, url_bar_bg);
             if browser.url_focused {
-                bb.draw_rect(content_x + 4, content_y + 4, content_w - 8, url_bar_h, Color::ACCENT);
+                bb.draw_rect(url_x, content_y + 4, url_w, url_bar_h, Color::ACCENT);
             }
+            let url_text_max = ((url_w.saturating_sub(20)) / 8) as usize;
             if browser.url_input.is_empty() {
-                // Dim placeholder text
                 let hint = if browser.url_focused {
                     "Type a URL or search term, then press Enter"
                 } else {
                     "Click to search or enter a URL"
                 };
-                bb.draw_string(content_x + 10, content_y + 8, hint, Color::TEXT_SECONDARY, Some(url_bar_bg));
+                bb.draw_string(url_x + 6, content_y + 8, hint, Color::TEXT_SECONDARY, Some(url_bar_bg));
             } else {
-                bb.draw_string(content_x + 10, content_y + 8, &browser.url_input, Color::TEXT_PRIMARY, Some(url_bar_bg));
+                // Show the tail of long URLs so the cursor stays visible
+                let shown: &str = if browser.url_input.len() > url_text_max {
+                    &browser.url_input[browser.url_input.len() - url_text_max..]
+                } else {
+                    &browser.url_input
+                };
+                bb.draw_string(url_x + 6, content_y + 8, shown, Color::TEXT_PRIMARY, Some(url_bar_bg));
+                if browser.url_focused {
+                    let cur_x = url_x + 6 + (shown.len() as u32 * 8);
+                    bb.fill_rect(cur_x, content_y + 7, 2, 16, Color::ACCENT);
+                }
             }
-            if browser.url_focused {
-                let cur_x = content_x + 10 + (browser.url_input.len() as u32 * 8);
-                bb.fill_rect(cur_x, content_y + 7, 2, 16, Color::ACCENT);
+            if browser.url_focused && browser.url_input.is_empty() {
+                bb.fill_rect(url_x + 6, content_y + 7, 2, 16, Color::ACCENT);
             }
 
-            // Content area
+            // Content area (layout is prepared before drawing each frame)
             let text_x = content_x + 8;
             let text_start_y = content_y + url_bar_h + 8;
             let text_h = content_h.saturating_sub(url_bar_h + status_h + 16);
-            let line_h: u32 = 14;
-            let char_w: u32 = 8;
-            let max_chars = ((content_w.saturating_sub(16)) / char_w) as usize;
+            let line_h: u32 = BROWSER_LINE_H;
             let max_lines = (text_h / line_h) as usize;
 
             bb.fill_rect(content_x, text_start_y, content_w, text_h, bg);
 
-            // Word-wrap content lines
-            let mut display_lines: Vec<String> = Vec::new();
-            for line in browser.content.lines() {
-                if line.is_empty() {
-                    display_lines.push(String::new());
-                } else {
-                    let mut rem = line;
-                    while !rem.is_empty() {
-                        if rem.len() <= max_chars {
-                            display_lines.push(String::from(rem));
-                            break;
+            let total = browser.layout.len();
+            let start = browser.scroll_offset.min(total.saturating_sub(1));
+            let end = (start + max_lines).min(total);
+
+            for (row, line) in browser.layout[start..end].iter().enumerate() {
+                let y = text_start_y + (row as u32 * line_h);
+                for span in line {
+                    let x = text_x + (span.col as u32 * 8);
+                    use crate::browser::SpanStyle;
+                    let (color, bold, underline) = if span.link.is_some() {
+                        (Color::rgb(110, 170, 255), false, true)
+                    } else {
+                        match span.style {
+                            SpanStyle::Heading => (Color::rgb(245, 245, 250), true, false),
+                            SpanStyle::Bold => (Color::rgb(235, 235, 240), true, false),
+                            SpanStyle::Pre => (Color::rgb(150, 220, 150), false, false),
+                            SpanStyle::Bullet => (Color::rgb(80, 200, 120), false, false),
+                            SpanStyle::Normal => (Color::rgb(210, 210, 215), false, false),
                         }
-                        let split = rem[..max_chars].rfind(' ').unwrap_or(max_chars);
-                        let (first, rest) = rem.split_at(split);
-                        display_lines.push(String::from(first));
-                        rem = rest.trim_start_matches(' ');
+                    };
+                    bb.draw_string(x, y, &span.text, color, Some(bg));
+                    if bold {
+                        // Fake bold: redraw shifted 1px (no background to avoid smearing)
+                        bb.draw_string(x + 1, y, &span.text, color, None);
+                    }
+                    if underline {
+                        bb.fill_rect(x, y + 12, span.text.len() as u32 * 8, 1, color);
                     }
                 }
             }
 
-            let total = display_lines.len();
-            let start = browser.scroll_offset.min(total.saturating_sub(1));
-            let end = (start + max_lines).min(total);
-
-            for (idx, line) in display_lines[start..end].iter().enumerate() {
-                let y = text_start_y + (idx as u32 * line_h);
-                let color = if line.starts_with("  * ") {
-                    Color::rgb(80, 200, 120)
-                } else if line.starts_with("---") || line.starts_with("[") {
-                    Color::rgb(100, 180, 255)
-                } else {
-                    Color::rgb(210, 210, 215)
-                };
-                if !line.is_empty() {
-                    bb.draw_string(text_x, y, line, color, Some(bg));
-                }
-            }
-
-            // Scroll indicator
+            // Scroll indicators
             if start > 0 {
                 bb.draw_string(content_x + content_w - 20, text_start_y, "^", Color::TEXT_SECONDARY, Some(bg));
+            }
+            if end < total {
+                bb.draw_string(
+                    content_x + content_w - 20,
+                    text_start_y + ((max_lines.saturating_sub(1)) as u32 * line_h),
+                    "v",
+                    Color::TEXT_SECONDARY,
+                    Some(bg),
+                );
             }
 
             // Status bar
             let status_y = content_y + content_h - status_h;
             bb.fill_rect(content_x, status_y, content_w, status_h, Color::rgb(32, 32, 36));
             bb.draw_string(content_x + 8, status_y + 3, &browser.status, Color::TEXT_SECONDARY, None);
-            if !browser.links.is_empty() {
-                let hint = alloc::format!("{} links | u=address bar", browser.links.len());
+            if !browser.doc.links.is_empty() {
+                let hint = alloc::format!("{} links | click to follow", browser.doc.links.len());
                 let hint_x = content_x + content_w.saturating_sub((hint.len() as u32 * 8) + 8);
                 bb.draw_string(hint_x, status_y + 3, &hint, Color::TEXT_SECONDARY, None);
             }
@@ -2011,6 +2151,14 @@ pub fn handle_mouse() {
                             }
                             state.needs_window_redraw = true;
                         }
+                        WindowContent::Browser(browser) => {
+                            if mouse_dy < 0 {
+                                browser.scroll_offset = browser.scroll_offset.saturating_sub(scroll_amount as usize);
+                            } else {
+                                browser.scroll_offset = browser.scroll_offset.saturating_add(scroll_amount as usize);
+                            }
+                            state.needs_window_redraw = true;
+                        }
                         _ => {}
                     }
                     break;
@@ -2063,6 +2211,16 @@ pub fn handle_mouse() {
                             } else {
                                 // Scroll down
                                 editor.scroll_y = editor.scroll_y.saturating_add(3);
+                            }
+                            state.needs_window_redraw = true;
+                        }
+                        WindowContent::Browser(browser) => {
+                            if scroll_delta > 0 {
+                                // Scroll up
+                                browser.scroll_offset = browser.scroll_offset.saturating_sub(3);
+                            } else {
+                                // Scroll down (clamped in prepare_browser_layouts)
+                                browser.scroll_offset = browser.scroll_offset.saturating_add(3);
                             }
                             state.needs_window_redraw = true;
                         }
@@ -2282,6 +2440,57 @@ pub fn handle_mouse() {
                     }
                 }
                 
+                // Handle browser content clicks (back button, URL bar, links)
+                if let Some(w) = state.windows.iter_mut().find(|w| w.id == id && w.focused) {
+                    let (wx, wy, ww, wh) = (w.x, w.y, w.width as i32, w.height as i32);
+                    if let WindowContent::Browser(browser) = &mut w.content {
+                        let content_x = wx + 1;
+                        let content_y = wy + 32;
+                        let content_w = ww - 2;
+                        let content_h = wh - 33;
+                        let url_bar_h: i32 = 28;
+                        let back_w: i32 = 26;
+                        let status_h: i32 = 20;
+
+                        let in_toolbar = my >= content_y + 4 && my < content_y + 4 + url_bar_h;
+                        if in_toolbar && mx >= content_x + 4 && mx < content_x + 4 + back_w {
+                            // Back button
+                            browser.go_back();
+                            state.needs_window_redraw = true;
+                        } else if in_toolbar && mx >= content_x + 4 + back_w + 4
+                            && mx < content_x + content_w - 4
+                        {
+                            // URL bar: focus and select-all-style clear on typing is
+                            // handled by the keyboard path; here we just focus it.
+                            browser.url_focused = true;
+                            state.needs_window_redraw = true;
+                        } else if my >= content_y + url_bar_h + 8
+                            && my < content_y + content_h - status_h
+                        {
+                            // Content area: follow a link if one was clicked.
+                            // Links are only 14px tall, so allow 3px vertical slop.
+                            browser.url_focused = false;
+                            let mut clicked: Option<u16> = None;
+                            for (rx, ry, rw, rh, link) in browser.link_rects.iter() {
+                                if mx >= *rx
+                                    && mx < rx + rw
+                                    && my >= ry - 3
+                                    && my < ry + rh + 3
+                                {
+                                    clicked = Some(*link);
+                                    break;
+                                }
+                            }
+                            if let Some(link) = clicked {
+                                if let Some(url) = browser.doc.links.get(link as usize).cloned() {
+                                    browser.navigate(url);
+                                }
+                            }
+                            state.needs_window_redraw = true;
+                        }
+                    }
+                }
+
                 // Handle text editor content clicks
                 if let Some(w) = state.windows.iter_mut().find(|w| w.id == id && w.focused) {
                     if let WindowContent::TextEditor(editor) = &mut w.content {
@@ -2810,6 +3019,11 @@ pub fn handle_key_event(event: &crate::drivers::keyboard::KeyEvent) {
                                 browser.scroll_offset = 0;
                                 state.needs_window_redraw = true;
                             }
+                            KeyCode::End => {
+                                // Clamped to the last page in prepare_browser_layouts
+                                browser.scroll_offset = usize::MAX / 2;
+                                state.needs_window_redraw = true;
+                            }
                             _ => {}
                         }
                     }
@@ -2954,15 +3168,7 @@ pub fn handle_keyboard(c: char) {
                             match c {
                                 '\n' | '\r' => {
                                     if let Some(url) = crate::browser::build_navigate_url(&browser.url_input) {
-                                        browser.url_input = url.clone();
-                                        browser.url_focused = false;
-                                        // Show loading state now — fetch happens after next screen draw
-                                        browser.content = alloc::format!(
-                                            "Loading: {}\n\nPlease wait...", url
-                                        );
-                                        browser.status = String::from("Fetching...");
-                                        browser.scroll_offset = 0;
-                                        browser.pending_url = Some(url);
+                                        browser.navigate(url);
                                     }
                                 }
                                 '\x08' | '\x7f' => {
@@ -2977,8 +3183,18 @@ pub fn handle_keyboard(c: char) {
                                 _ => {}
                             }
                         } else {
-                            if c == 'u' || c == 'U' {
-                                browser.url_focused = true;
+                            match c {
+                                // 'u' focuses the address bar with a clean slate
+                                // (no more backspacing through the old URL)
+                                'u' | 'U' => {
+                                    browser.url_focused = true;
+                                    browser.url_input.clear();
+                                }
+                                // Backspace goes back
+                                '\x08' | '\x7f' => {
+                                    browser.go_back();
+                                }
+                                _ => {}
                             }
                         }
                         state.needs_window_redraw = true;
@@ -3034,16 +3250,16 @@ fn handle_pending_browser_fetch() {
                         if let WindowContent::Browser(b) = &mut w.content {
                             let url = b.url_input.clone();
                             match result {
-                                Ok((text, links)) => {
-                                    b.content = text;
-                                    b.links = links;
+                                Ok(doc) => {
+                                    b.set_doc(doc);
+                                    b.current_url = url.clone();
                                     b.status = alloc::format!("OK — {}", url);
                                 }
                                 Err(e) => {
-                                    b.content = alloc::format!(
+                                    b.set_doc(crate::browser::Document::from_text(&alloc::format!(
                                         "Could not load page.\n\nError: {}\n\nWorking sites:\n  * http://example.com\n  * http://info.cern.ch\n  * http://wiby.me\n  * http://neverssl.com",
                                         e
-                                    );
+                                    )));
                                     b.status = alloc::format!("Error: {}", e);
                                 }
                             }
@@ -3132,6 +3348,9 @@ pub fn run() {
             }
         }
         
+        // Update browser word-wrap layouts + link hit rectangles
+        prepare_browser_layouts();
+
         // Draw EVERYTHING to back buffer (no flicker because it's in memory)
         let bb = BackBuffer::new();
         draw_background(&bb);
